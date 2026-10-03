@@ -297,11 +297,10 @@ jobs:
               #
               # This replaces /api/street-geoms.json, which sourced geometry
               # live from public Overpass mirrors - banned by AGENTS.md. Where
-              # it had nothing cached it answered count:0, and the atlas drew a
-              # stand-in: Hong Kong's 30 popular streets all rendered as
-              # identical short diagonal stubs. Melbourne only looked correct
-              # because its geometry had been cached from an earlier Overpass
-              # run, so whether a city looked right was a cache lottery.
+              # it had nothing cached it answered count:0 and the atlas drew a
+              # stand-in, so Hong Kong's 30 popular streets all rendered as
+              # identical short diagonal stubs while Melbourne looked correct
+              # only because its geometry was already cached.
               #
               # Best-effort: a city with no street list yet just gets no file and
               # the atlas falls back, so this must never fail the outline build.
@@ -311,11 +310,8 @@ jobs:
               curl -fsS --max-time 60 -o "work/streets-$slug.json" \
                 "https://preview-geo-astro-site.foodstarmelbourne.workers.dev/api/city-streets.json?city=$slug-city-atlas" \
                 || echo '{}' > "work/streets-$slug.json"
-              # Status captured separately from the text. Using the assignment
-              # itself as the condition made bash evaluate the captured notice
-              # as a test operand, warning "[: ::notice::street-geoms ...:
-              # unary operator expected" twice per city. Splitting the two
-              # removes the whole class of problem, whichever shell runs it.
+              # Status captured separately from the captured text, so the summary is
+              # never itself used as a test operand.
               if SG=$(python scripts/extract_street_geoms.py \
                         --slug "$slug" --pbf "$pbf" \
                         --streets "work/streets-$slug.json" \
@@ -326,17 +322,11 @@ jobs:
                   RC=$?
                 fi
               if [ "$RC" -eq 0 ]; then
-                # Plain log line, not a :: annotation.
-                #
-                # The runner's log processor re-reads annotation payloads, and
-                # handing it a JSON blob containing [], {} and quotes produced
-                # spurious "line NNN: [: ::notice::street-geoms ...: unary
-                # operator expected" warnings - the message text echoed back as
-                # if bash had run a test on it. Every [ in this workflow quotes
-                # its operand; the construct was sound, and reproducing it in
-                # plain bash is silent. Keeping the payload out of the
-                # annotation removes the noise at the source and leaves the
-                # summary readable in the log.
+                # Reported as a plain log line rather than an annotation.
+                # Actions echoes this step's own source into the log and its
+                # processor re-reads fragments, so an explanatory comment that
+                # quotes a shell diagnostic ends up printed as if the script had
+                # emitted it. Describe the reasoning, do not paste the message.
                 echo "street-geoms $slug: $SG"
               else
                 echo "::error::street-geoms $slug failed (rc=$RC); the atlas will fall back. $SG"
