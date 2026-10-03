@@ -291,6 +291,30 @@ jobs:
                 --pbf "$pbf" --bbox="$bbox" \
                 --out-dir "work/out/$slug" >/dev/null 2>&1 \
                 || { rm -f "$pbf"; echo -1; return; }
+                # Transit stations + route geometry, reusing the city PBF cut above. No extra
+                # country download: this is the same file extract_city_2d_data.py just read.
+                # The registries store bbox as minLng,minLat,maxLng,maxLat; my extractors take
+                # minLat,minLon,maxLat,maxLon, so swap rather than assume.
+                r1="${bbox#*,}"; lat="${r1%%,*}"; r2="${r1#*,}"; lon="${r2%%,*}"
+                r3="${r2#*,}"; lat2="${r3%%,*}"; lon2="${r3#*,}"
+                BBOX_LL="${lat},${lon},${lat2},${lon2}"
+                targs=()
+                if [ -f transit-hub-filters.json ]; then
+                while IFS= read -r a && IFS= read -r b; do targs+=("$a" "$b"); done < <(
+                jq -r --arg c "$SLUG" '(. as $r | $r[$c] // {}) as $x
+                | (($x.keepNetworks // [])[] | "--network\t" + .),
+                (($x.keepOperators // [])[] | "--operator\t" + .)' \
+                transit-hub-filters.json 2>/dev/null || true)
+                fi
+                python scripts/extract_transit_hubs.py \
+                --city "$SLUG" --extract "$ex" --pbf "$pbf" --bbox="$BBOX_LL" \
+                "${targs[@]}" --out "work/out/$SLUG/transit-stations.json" \
+                >/dev/null 2>&1 || rm -f "work/out/$SLUG/transit-stations.json"
+                python scripts/extract_transit_lines.py \
+                --city "$SLUG" --extract "$ex" --pbf "$pbf" --bbox="$BBOX_LL" \
+                "${targs[@]}" --out "work/out/$SLUG/transit-lines.json" \
+                >/dev/null 2>&1 || rm -f "work/out/$SLUG/transit-lines.json"
+
 
               # Real OSM road geometry for the atlas Popular Streets tab, cut
               # from the same city PBF the boundaries came from.

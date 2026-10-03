@@ -1,0 +1,21 @@
+{
+  "_comment": [
+    "Per-city rules for extract_transit_hubs.py. Most cities need no rules at all,",
+    "because their stations carry no network/operator tag or because the extract",
+    "does not spill into a neighbour. Hong Kong does: geofabrik's 'hongkong'",
+    "extract also contains Shenzhen, and Shenzhen sits inside Hong Kong's bbox,",
+    "so coordinates cannot separate them.",
+    "",
+    "'keepNetworks' / 'keepOperators' are matched case-insensitively as substrings.",
+    "An entry of null means no filter on that axis for that city.",
+    "",
+    "IMPORTANT: keepOperators here must not match Hong Kong's Shenzhen joint",
+    "ventures (港铁轨道交通（深圳）etc). Those are Shenzhen lines operated by an",
+    "MTR joint venture, not Hong Kong stations, and a loose 'MTR' substring match",
+    "would silently pull in 41 Shenzhen stations."
+  ],
+  "hongkong": {
+    "keepNetworks": ["MTR", "港鐵"],
+    "keepOperators": ["香港鐵路有限公司"]
+  }
+}
