@@ -326,9 +326,20 @@ jobs:
                   RC=$?
                 fi
               if [ "$RC" -eq 0 ]; then
-                echo "::notice::street-geoms $slug: $SG"
+                # Plain log line, not a :: annotation.
+                #
+                # The runner's log processor re-reads annotation payloads, and
+                # handing it a JSON blob containing [], {} and quotes produced
+                # spurious "line NNN: [: ::notice::street-geoms ...: unary
+                # operator expected" warnings - the message text echoed back as
+                # if bash had run a test on it. Every [ in this workflow quotes
+                # its operand; the construct was sound, and reproducing it in
+                # plain bash is silent. Keeping the payload out of the
+                # annotation removes the noise at the source and leaves the
+                # summary readable in the log.
+                echo "street-geoms $slug: $SG"
               else
-                echo "::warning::street-geoms $slug failed (rc=$RC), atlas will fall back: $SG"
+                echo "::error::street-geoms $slug failed (rc=$RC); the atlas will fall back. $SG"
                 rm -f "work/out/$slug/street-geoms.json"
               fi
               rm -f "work/streets-$slug.json"
