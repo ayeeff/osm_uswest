@@ -1,4 +1,4 @@
-﻿name: OSM city neighbourhood boundaries
+name: OSM city neighbourhood boundaries
 
 # Builds neighborhoods.json ONLY (no places.json / demand-streets.json) for every
 # city in cities-neighborhoods.json that names a geofabrik extract, from the per-country OSM
@@ -38,6 +38,11 @@ on:
         default: true
       overwrite_enriched:
         description: "Replace published files that already carry population/photo enrichment"
+        type: boolean
+        required: false
+        default: false
+      diagnose:
+        description: "Report the real OSM names near every street that failed to match"
         type: boolean
         required: false
         default: false
@@ -126,6 +131,8 @@ jobs:
       CITIES: ${{ join(matrix.group.cities, ' ') }}
       PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.publish == false && 'false' || 'true' }}
       FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.overwrite_enriched == true && 'true' || 'false' }}
+      # Empty string = off. Expands to --diagnose only when the input is set.
+      DIAGNOSE: ${{ github.event_name == 'workflow_dispatch' && inputs.diagnose == true && '1' || '' }}
       # The only sanctioned OSM source. Never reach for a public Overpass mirror.
       # See AGENTS.md "CRITICAL -- No public Overpass API. Ever."
       R2_BUCKET: geo-datalake
@@ -284,6 +291,48 @@ jobs:
                 --pbf "$pbf" --bbox="$bbox" \
                 --out-dir "work/out/$slug" >/dev/null 2>&1 \
                 || { rm -f "$pbf"; echo -1; return; }
+
+              # Real OSM road geometry for the atlas Popular Streets tab, cut
+              # from the same city PBF the boundaries came from.
+              #
+              # This replaces /api/street-geoms.json, which sourced geometry
+              # live from public Overpass mirrors - banned by AGENTS.md. Where
+              # it had nothing cached it answered count:0, and the atlas drew a
+              # stand-in: Hong Kong's 30 popular streets all rendered as
+              # identical short diagonal stubs. Melbourne only looked correct
+              # because its geometry had been cached from an earlier Overpass
+              # run, so whether a city looked right was a cache lottery.
+              #
+              # Best-effort: a city with no street list yet just gets no file and
+              # the atlas falls back, so this must never fail the outline build.
+              # But it must not fail *silently* either - the first run of this
+              # step discarded a perfectly good file and the only symptom was a
+              # 404 much later. Report what happened either way.
+              curl -fsS --max-time 60 -o "work/streets-$slug.json" \
+                "https://preview-geo-astro-site.foodstarmelbourne.workers.dev/api/city-streets.json?city=$slug-city-atlas" \
+                || echo '{}' > "work/streets-$slug.json"
+              # Status captured separately from the text. Using the assignment
+              # itself as the condition made bash evaluate the captured notice
+              # as a test operand, warning "[: ::notice::street-geoms ...:
+              # unary operator expected" twice per city. Splitting the two
+              # removes the whole class of problem, whichever shell runs it.
+              if SG=$(python scripts/extract_street_geoms.py \
+                        --slug "$slug" --pbf "$pbf" \
+                        --streets "work/streets-$slug.json" \
+                        ${DIAGNOSE:+--diagnose} \
+                        --out "work/out/$slug/street-geoms.json" 2>&1); then
+                  RC=0
+                else
+                  RC=$?
+                fi
+              if [ "$RC" -eq 0 ]; then
+                echo "::notice::street-geoms $slug: $SG"
+              else
+                echo "::warning::street-geoms $slug failed (rc=$RC), atlas will fall back: $SG"
+                rm -f "work/out/$slug/street-geoms.json"
+              fi
+              rm -f "work/streets-$slug.json"
+
               rm -f "$pbf"
               jq '.features | length' "work/out/$slug/neighborhoods.json" 2>/dev/null || echo 0
             }
@@ -406,6 +455,26 @@ jobs:
                    work/live.json >/dev/null 2>&1; then
                 echo "::notice::$SLUG is already enriched; keeping the published file (set overwrite_enriched to replace it)"
                 rm -f work/live.json
+                # The guard above protects one file: neighborhoods.json, which
+                # carries Wikidata population and photos. It must not block the
+                # others. It did, and silently: Hong Kong is enriched, so its
+                # run skipped straight past publishing and the street geometry
+                # built earlier in this loop was thrown away. That is precisely
+                # the tab that was broken, so "already enriched" has to mean
+                # "keep neighborhoods.json", not "publish nothing".
+                if [ "$PUBLISH" = "true" ]; then
+                  for F in street-geoms.json; do
+                    [ -f "$D/$F" ] || continue
+                    aws s3 cp "$D/$F" "s3://globe/data/${SLUG}-2d/$F" \
+                      --no-progress --only-show-errors
+                    # Durable copy too, as the normal path does. Writing only
+                    # globe/ here would leave the datalake without the file
+                    # while the site served it, which is the reverse of the
+                    # split that made this confusing to begin with.
+                    aws s3 cp "$D/$F" "s3://$R2_BUCKET/sources/osm/places/${SLUG}/$F" \
+                      --no-progress --only-show-errors
+                  done
+                fi
                 echo "{\"slug\":\"$SLUG\",\"features\":$N,\"extract\":\"$EXTRACT\",\"skipped\":\"already-enriched\"}" >> artifact/manifest.jsonl
                 continue
               fi
@@ -431,14 +500,14 @@ jobs:
             # request 404s. The durable copies below go to geo-datalake on
             # purpose, because that is the datalake.
             if [ "$PUBLISH" = "true" ]; then
-              for F in places.json demand-streets.json neighborhoods.json; do
+              for F in places.json demand-streets.json neighborhoods.json street-geoms.json; do
                 [ -f "$D/$F" ] || { echo "  no $F for $SLUG"; continue; }
                 aws s3 cp "$D/$F" "s3://globe/data/${SLUG}-2d/$F" \
                   --no-progress --only-show-errors
               done
             fi
             # Durable copy alongside the extractor manifest.
-            for F in places.json demand-streets.json neighborhoods.json; do
+            for F in places.json demand-streets.json neighborhoods.json street-geoms.json; do
               [ -f "$D/$F" ] || continue
               aws s3 cp "$D/$F" "s3://$R2_BUCKET/sources/osm/places/${SLUG}/$F" \
                 --no-progress --only-show-errors
