@@ -1,0 +1,170 @@
+name: osm-city-streets
+# Per-country OSM street extraction for the Popular Streets tab.
+#
+# Each matrix job pulls one Geofabrik country extract from geo-datalake
+# (sources/osm/<slug>-latest.osm.pbf, uploaded by
+# scripts/osm-planet/fetch-geofabrik-countries.mjs), trims it to named highways
+# with the C++ osmium tools, then runs the Python extractor for every major city
+# (pop >= MIN_POP) whose bbox falls inside that country. Results land in R2 at
+# data/osm-city-streets/<slug>.json and are merged into
+# public/data/city-streets/<city>.json by scripts/merge-city-streets.mjs.
+#
+# The extract list lives in scripts/osm-planet/country-extracts.json so it can be
+# regenerated from the download plan without touching this file.
+on:
+  workflow_dispatch:
+    inputs:
+      extracts:
+        description: 'comma-separated extract slugs (blank = all)'
+        required: false
+        default: ''
+      max-parallel:
+        description: 'parallel country jobs'
+        required: false
+        default: '6'
+      force-refresh:
+        description: 're-extract even if the result already exists in R2'
+        type: boolean
+        required: false
+        default: false
+
+env:
+  MIN_POP: '2000000'
+  STREET_CAP: '320'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      slugs: ${{ steps.pick.outputs.slugs }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: pick
+        env:
+          EXTRACTS_INPUT: ${{ inputs.extracts }}
+        run: |
+          node -e "
+          const fs=require('fs');
+          const raw=(process.env.EXTRACTS_INPUT||'').trim();
+          const all=JSON.parse(fs.readFileSync('scripts/osm-planet/country-extracts.json','utf8')).extracts;
+          // allowlist-only: never trust dispatch input beyond the known extract slugs
+          const requested=raw?raw.split(',').map(s=>s.trim()).filter(Boolean):[];
+          const unknown=requested.filter(s=>!all.includes(s));
+          if(unknown.length){console.error('unknown extract slug(s):',unknown.join(', '));process.exit(1);}
+          const list=requested.length?requested:all;
+          console.log('extracts:',list.length,list.slice(0,6).join(','),'...');
+          fs.writeFileSync('/tmp/slugs.json',JSON.stringify(list));
+          "
+          echo "slugs=$(cat /tmp/slugs.json)" >> $GITHUB_OUTPUT
+
+  extract:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max-parallel || '6') }}
+      matrix:
+        extract: ${{ fromJSON(needs.prepare.outputs.slugs) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install osmium tools + python bindings
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq osmium-tool
+          pip install --quiet osmium numpy
+          osmium --version | head -2
+
+      - name: Configure R2 credentials
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.R2_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.R2_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_ENDPOINT_URL=https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=auto" >> $GITHUB_ENV
+
+      - name: Build major-city list
+        run: |
+          node -e "
+          const fs=require('fs');
+          const c=JSON.parse(fs.readFileSync('public/data/atlas-collections.json','utf8'));
+          const minPop=Number(process.env.MIN_POP);
+          const cities=(c.City||[]).filter(x=>x&&typeof x.pop==='number'&&x.pop>=minPop&&x.lat!=null&&x.lng!=null)
+            .map(x=>({slug:x.slug,name:x.name,lat:x.lat,lng:x.lng,pop:x.pop}));
+          fs.writeFileSync('/tmp/cities.json',JSON.stringify(cities));
+          console.log('major cities:',cities.length);
+          "
+
+      - name: Check if already extracted
+        id: check
+        env:
+          EXTRACT: ${{ matrix.extract }}
+          FORCE_REFRESH: ${{ inputs.force-refresh }}
+        run: |
+          if [ "$FORCE_REFRESH" = "true" ]; then
+            echo "exists=false (force-refresh)"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          elif aws s3api head-object --bucket geo-datalake --key "data/osm-city-streets/${EXTRACT}.json" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download country extract from R2
+        if: steps.check.outputs.exists != 'true'
+        env:
+          EXTRACT: ${{ matrix.extract }}
+        run: |
+          df -h /tmp | tail -1
+          aws s3 cp "s3://geo-datalake/sources/osm/${EXTRACT}-latest.osm.pbf" /tmp/src.osm.pbf --no-progress
+          ls -lh /tmp/src.osm.pbf
+          EXPECTED=$(aws s3 cp "s3://geo-datalake/sources/osm/checksums/${EXTRACT}-latest.sha256" - 2>/dev/null | tr -d '\r\n ' || true)
+          if [ -n "$EXPECTED" ]; then
+            echo "${EXPECTED}  /tmp/src.osm.pbf" | sha256sum --check --status || { echo "PBF checksum mismatch"; exit 1; }
+            echo "PBF checksum verified"
+          else
+            echo "no checksum published for ${EXTRACT} — skipping verification"
+          fi
+
+      - name: Prefilter to named highways (C++)
+        if: steps.check.outputs.exists != 'true'
+        run: |
+          # Keep every highway way AND the node objects they reference (-R):
+          # city-streets-pbf.py reads raw node blobs (apply_file(locations=False))
+          # to build its coordinate index, so without -R every way resolves to
+          # null geometry. The highway-type predicate keeps the intermediate PBF
+          # small (w/name alone also matches buildings/rivers/parks) and the
+          # Python stage drops unnamed ways via its own `name` check.
+          osmium tags-filter -R -f pbf -o /tmp/nhw.osm.pbf --overwrite /tmp/src.osm.pbf \
+            w/highway=motorway,trunk,primary,secondary,tertiary,unclassified,residential,living_street,pedestrian,service
+          rm -f /tmp/src.osm.pbf
+          ls -lh /tmp/nhw.osm.pbf
+          df -h /tmp | tail -1
+
+      - name: Extract city streets
+        if: steps.check.outputs.exists != 'true'
+        run: |
+          python scripts/osm-planet/city-streets-pbf.py /tmp/nhw.osm.pbf /tmp/cities.json /tmp/out.json "$STREET_CAP"
+          node -e "
+          const d=JSON.parse(require('fs').readFileSync('/tmp/out.json','utf8'));
+          const entries=Object.entries(d.cities||{}).filter(([,c])=>(c.streets||[]).length);
+          const total=entries.reduce((s,[,c])=>s+c.streets.length,0);
+          console.log('cities with streets:',entries.length,'streets:',total);
+          for(const [slug,c] of entries) console.log('  ',slug,c.streets.length);
+          // Never publish (and let the skip-if-exists guard lock in) an empty
+          // result — a silent geometry regression would survive every re-run.
+          if(!total){console.error('ERROR: extractor produced zero streets — refusing to upload');process.exit(1);}
+          "
+
+      - name: Upload result to R2
+        if: steps.check.outputs.exists != 'true'
+        env:
+          EXTRACT: ${{ matrix.extract }}
+        run: |
+          aws s3 cp /tmp/out.json "s3://geo-datalake/data/osm-city-streets/${EXTRACT}.json" \
+            --content-type application/json --no-progress --checksum-algorithm SHA256
+          echo "uploaded data/osm-city-streets/${EXTRACT}.json"
