@@ -540,7 +540,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: neighbourhoods-${{ matrix.group.extract }}-${{ github.run_attempt }}
+          # Artifact names cannot contain '/'. The Puerto Rico extract is keyed
+          # sources/osm/us/puerto-rico-latest.osm.pbf, so the raw extract slug
+          # makes the name invalid and the whole step fails with
+          # "The artifact name is not valid ... Contains the following character".
+          # Replace separators rather than dropping them, so us/puerto-rico stays
+          # us-puerto-rico and cannot collide with a real extract of that name.
+          name: neighbourhoods-${{ replace(matrix.group.extract, '/', '-') }}-${{ github.run_attempt }}
           path: artifact/
           retention-days: 7
           if-no-files-found: ignore
