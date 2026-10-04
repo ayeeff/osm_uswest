@@ -393,7 +393,18 @@ def fetch_street_payload(slug, explicit=None, timeout=60):
     """
     if explicit:
         with open(explicit, encoding="utf-8-sig") as fh:
-            return json.load(fh)
+            preloaded = json.load(fh)
+        if preloaded.get("streets"):
+            return preloaded
+        # An explicit but EMPTY payload is a miss, not an answer.
+        #
+        # The workflow pre-fetches the list with curl and passes it as
+        # --streets, so the 404 for a mismatched slug becomes a literal "{}" on
+        # disk before this function is ever called. Returning it made the alias
+        # table unreachable and the city silently produced nothing. Falling
+        # through re-tries the API and gets the aliases.
+        print(json.dumps({"note": "prefetched street list was empty, retrying",
+                          "slug": slug}))
 
     candidates = [slug] + list(CITY_STREET_ALIASES.get(slug, []))
     last_error = None
