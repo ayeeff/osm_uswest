@@ -146,15 +146,22 @@ def simplify(coords, min_m=2.0):
     return out
 
 
-def load_street_names(path, limit):
+def load_street_names(source, limit):
     """
-    Pull the streets to resolve out of a city-streets payload - either the full
-    API document or a bare list. Returns (seeds, names) where each seed carries
-    the canonical key, the display name and the lat/lon the dataset placed it at.
-    Best-known streets first, deduplicated on the canonical key.
+    Pull the streets to resolve out of a city-streets payload. Accepts either an
+    already-parsed document or a path, because the caller now resolves the
+    document through the alias fallback and the path would be the stale,
+    mismatched-slug file that prompted it.
+
+    Returns (seeds, names) where each seed carries the canonical key, the display
+    name and the lat/lon the dataset placed it at. Best-known streets first,
+    deduplicated on the canonical key.
     """
-    with open(path, encoding="utf-8-sig") as fh:
-        doc = json.load(fh)
+    if isinstance(source, (dict, list)):
+        doc = source
+    else:
+        with open(source, encoding="utf-8-sig") as fh:
+            doc = json.load(fh)
     rows = doc.get("streets") if isinstance(doc, dict) else doc
     if not rows:
         return [], []
@@ -446,7 +453,10 @@ def main():
     args = ap.parse_args()
 
     payload = fetch_street_payload(args.slug, args.streets)
-    seeds, names = load_street_names(args.streets or payload, args.limit)
+    # The resolved payload, not args.streets: fetch_street_payload may have
+    # replaced a stale prefetched file with an aliased fetch, and passing the
+    # path back would re-read the empty file the fallback just rejected.
+    seeds, names = load_street_names(payload, args.limit)
     if not seeds:
         print(json.dumps({"slug": args.slug, "count": 0, "geoms": {},
                           "note": "no street names to resolve"}))
