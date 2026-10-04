@@ -299,34 +299,6 @@ jobs:
               # of ~190.
               osmium extract -b "$bbox" -s complete_ways -F pbf -o "$pbf" \
                 "$base" >/dev/null 2>&1 || { rm -f "$pbf"; echo -1; return; }
-
-                # Transit stations + route geometry, reusing the city PBF cut above.
-                #
-                # Placed against the cut, NOT after extract_city_2d_data.py: that call
-                # early-returns when neighbourhoods come back empty, so a block placed after it
-                # is skipped silently while the job still reports success. That is how a dispatch
-                # produced no transit files for any city and every job came back green.
-                #
-                # The registry gives bbox as minLng,minLat,maxLng,maxLat and these extractors
-                # want minLat,minLon,maxLat,maxLon. Split on commas rather than swapping by hand
-                # with ${var#*,}: a transposed tail is still a valid bbox, so it returned 0
-                # stations without failing.
-                IFS=',' read -r lon1 lat1 lon2 lat2 <<< "$bbox"
-                BBOX_LL="$lat1,$lon1,$lat2,$lon2"
-                mkdir -p work/out/$SLUG
-                python scripts/extract_transit_hubs.py --city $SLUG --extract $ex \
-                  --pbf $pbf --bbox=$BBOX_LL \
-                  --filters transit-hub-filters.json \
-                  --out work/out/$SLUG/transit-stations.json \
-                  >work/out/$SLUG/transit-hubs.log 2>&1 \
-                  || echo ::warning=transit-stations-failed-for-$SLUG
-                python scripts/extract_transit_lines.py --city $SLUG --extract $ex \
-                  --pbf $pbf --bbox=$BBOX_LL \
-                  --filters transit-hub-filters.json \
-                  --out work/out/$SLUG/transit-lines.json \
-                  >work/out/$SLUG/transit-lines.log 2>&1 \
-                  || echo ::warning=transit-lines-failed-for-$SLUG
-                ls -l work/out/$SLUG/transit-stations.json work/out/$SLUG/transit-lines.json || true
               # --bbox= not --bbox : a bbox like -0.51672,5.25,0.08,5.85 starts
               # with a minus, and argparse reads a space-separated value
               # beginning with "-" as the next flag, so it fails with "expected
