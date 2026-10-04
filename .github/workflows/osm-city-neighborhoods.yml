@@ -162,6 +162,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Artifact names may not contain '/'. The Puerto Rico extract really is
+      # keyed sources/osm/us/puerto-rico-latest.osm.pbf, so the raw extract slug
+      # produces "The artifact name is not valid ... Contains the following
+      # character" and fails the step. Computed in the shell because GitHub does
+      # not expose replace() to a job-level `name:` expression, and env
+      # substitution alone would carry the slash straight through.
+      - name: Derive an artifact-safe extract slug
+        run: echo "ARTIFACT_SAFE_EXTRACT=${EXTRACT//\//-}" >> "$GITHUB_ENV"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -542,11 +551,11 @@ jobs:
         with:
           # Artifact names cannot contain '/'. The Puerto Rico extract is keyed
           # sources/osm/us/puerto-rico-latest.osm.pbf, so the raw extract slug
-          # makes the name invalid and the whole step fails with
-          # "The artifact name is not valid ... Contains the following character".
-          # Replace separators rather than dropping them, so us/puerto-rico stays
-          # us-puerto-rico and cannot collide with a real extract of that name.
-          name: neighbourhoods-${{ replace(matrix.group.extract, '/', '-') }}-${{ github.run_attempt }}
+          # makes the name invalid and the step fails with "The artifact name is
+          # not valid ... Contains the following character". env substitution
+          # rather than a replace() expression, because GitHub does not expose
+          # replace() to workflow_call/job-level if expressions.
+          name: neighbourhoods-${{ env.ARTIFACT_SAFE_EXTRACT }}-${{ github.run_attempt }}
           path: artifact/
           retention-days: 7
           if-no-files-found: ignore
