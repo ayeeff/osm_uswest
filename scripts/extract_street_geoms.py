@@ -73,6 +73,30 @@ SEED_RADIUS_M = 2500.0
 # the report exists to draw between "named differently" and "not there".
 DIAG_RADIUS_M = 4000.0
 
+# Slugs where the page name and the city-streets index name differ. Verified by
+# querying the index: washingtondc, washington and newyorkcity all 404, while dc,
+# ny, sf and la all answer with hundreds of streets.
+#
+# Kept explicit and one-directional. Each entry was checked against the live
+# index, and adding an alias that does not exist would silently resolve some other
+# city's streets onto this page - the precise failure this pipeline exists to
+# prevent.
+CITY_STREET_ALIASES = {
+    "washingtondc": ["dc", "washington"],
+    "newyorkcity": ["ny", "newyork"],
+    "sanfrancisco": ["sf"],
+    "losangeles": ["la"],
+    "mexicocity": ["mexico-city"],
+    "hcmc": ["hochiminhcity"],
+    "kolkata": ["calcutta"],
+    "mumbai": ["bombay"],
+    "chennai": ["madras"],
+    "bengaluru": ["bangalore"],
+    "beijing": ["peking"],
+    "saopaulo": ["sao-paulo"],
+    "riyadh": ["riyadh-city"],
+}
+
 # Address datasets and OSM spell the same street differently often enough to
 # matter: "Tiergartenstrasse" vs "TiergartenstraÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â¸e", "GÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¶teborgsgatan" vs
 # "Goteborgsgatan". Folding these before matching recovered most of the misses.
@@ -354,14 +378,49 @@ class DiagnoseCollector(osmium.SimpleHandler):
 
 
 def fetch_street_payload(slug, explicit=None, timeout=60):
-    """The list of streets to resolve. Prefers a local file, else the public API."""
+    """The list of streets to resolve. Prefers a local file, else the public API.
+
+    The city-streets index does not always use the same slug as the page. The
+    Washington DC page is washingtondc-property-atlas while the index calls it
+    "dc", so a single-slug lookup 404s and the city resolves nothing - reported as
+    "no street names to resolve", which reads like an empty dataset rather than a
+    wrong key. Same shape for ny/newyorkcity, sf/sanfrancisco, la/losangeles.
+
+    So when the exact slug misses, try the documented aliases for that city.
+    Aliases are explicit rather than generated: guessing would risk resolving one
+    city's streets onto another's page, which is the failure mode this pipeline
+    exists to prevent.
+    """
     if explicit:
         with open(explicit, encoding="utf-8-sig") as fh:
             return json.load(fh)
-    url = f"https://preview-geo-astro-site.foodstarmelbourne.workers.dev/api/city-streets.json?city={slug}"
-    req = urllib.request.Request(url, headers={"User-Agent": "ayeeff/geo-atlas-2d/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+
+    candidates = [slug] + list(CITY_STREET_ALIASES.get(slug, []))
+    last_error = None
+    for cand in candidates:
+        url = ("https://preview-geo-astro-site.foodstarmelbourne.workers.dev"
+               f"/api/city-streets.json?city={cand}")
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "ayeeff/geo-atlas-2d/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:  # 404 for an unknown slug is the expected miss
+            last_error = exc
+            continue
+        if payload.get("streets"):
+            if cand != slug:
+                print(json.dumps({"note": "street list resolved via alias",
+                                  "asked": slug, "used": cand}))
+            return payload
+        # A 200 with an empty list is a real answer, but keep looking in case an
+        # alias does have data.
+        last_error = "empty street list for %s" % cand
+
+    if last_error is not None:
+        print(json.dumps({"note": "no street list found", "slug": slug,
+                          "tried": candidates, "detail": str(last_error)[:120]}))
+    return {"streets": []}
 
 
 def main():
