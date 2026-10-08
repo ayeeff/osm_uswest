@@ -1,0 +1,69 @@
+name: split-pmtiles-buildings
+# Strips the buildings layer from <slug>.pmtiles using tile-join,
+# extracts building tiles, generates buildings.bin and buildings.json,
+# and uploads all 3 artifacts back to R2 (s3://globe/data/<slug>-2d/).
+
+on:
+  workflow_dispatch:
+    inputs:
+      city:
+        description: 'City slug (e.g. amsterdam, berlin, or all)'
+        required: true
+        default: 'all'
+      concurrency:
+        description: 'Parallel batch workers'
+        required: false
+        default: '4'
+
+jobs:
+  split-buildings:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Node dependencies
+        run: |
+          npm install
+
+      - name: Verify AWS CLI
+        run: |
+          aws --version
+
+      - name: Install Tippecanoe (tile-join)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git build-essential libsqlite3-dev zlib1g-dev pkg-config
+          git clone --depth 1 https://github.com/felt/tippecanoe.git
+          cd tippecanoe
+          make -j$(nproc)
+          sudo make install
+          cd ..
+          rm -rf tippecanoe
+          tippecanoe -v
+
+      - name: Configure AWS credentials for Cloudflare R2
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID || secrets.R2_DATALAKE_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY || secrets.R2_DATALAKE_SECRET_ACCESS_KEY }}
+        run: |
+          aws configure set aws_access_key_id "$R2_ACCESS_KEY_ID"
+          aws configure set aws_secret_access_key "$R2_SECRET_ACCESS_KEY"
+          aws configure set default.region auto
+
+      - name: Run PMTiles Buildings Split Pipeline
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID || secrets.R2_DATALAKE_ACCOUNT_ID }}
+          R2_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID || secrets.R2_DATALAKE_ACCOUNT_ID }}
+          R2_DATALAKE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID || secrets.R2_DATALAKE_ACCOUNT_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID || secrets.R2_DATALAKE_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY || secrets.R2_DATALAKE_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          chmod +x scripts/split-pmtiles-buildings.sh
+          node scripts/batch-split-pmtiles-buildings.mjs --city "${{ inputs.city }}" --concurrency "${{ inputs.concurrency }}"
