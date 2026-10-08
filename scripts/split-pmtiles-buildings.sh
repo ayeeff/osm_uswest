@@ -54,6 +54,10 @@ if [ -f "${WORKDIR}/out/buildings.json" ] && [ -f "${WORKDIR}/out/buildings.bin"
   aws s3 cp "${WORKDIR}/out/buildings.json" "s3://globe/data/${SLUG}-2d/buildings.json" --endpoint-url "$ENDPOINT"
   aws s3 cp "${WORKDIR}/out/buildings.bin" "s3://globe/data/${SLUG}-2d/buildings.bin" --endpoint-url "$ENDPOINT"
   echo "  ✓ Uploaded buildings.json and buildings.bin"
+  if [ -f "${WORKDIR}/out/buildings-3d.json" ]; then
+    aws s3 cp "${WORKDIR}/out/buildings-3d.json" "s3://globe/data/${SLUG}-2d/buildings-3d.json" --endpoint-url "$ENDPOINT"
+    echo "  ✓ Uploaded buildings-3d.json"
+  fi
 else
   echo "  - No buildings extracted for ${SLUG}."
 fi

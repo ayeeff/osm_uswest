@@ -128,7 +128,42 @@ async function main() {
         }
 
         const center = [sumLon / coords.length, sumLat / coords.length];
-        buildingPolygons.push({ ring: coords, center });
+
+        let height = null;
+        if (feat.properties.height || feat.properties.render_height) {
+          const hVal = parseFloat(feat.properties.height || feat.properties.render_height);
+          if (!isNaN(hVal) && hVal > 0) height = Number(hVal.toFixed(1));
+        }
+        let minHeight = 0;
+        if (feat.properties.min_height || feat.properties.render_min_height) {
+          const mhVal = parseFloat(feat.properties.min_height || feat.properties.render_min_height);
+          if (!isNaN(mhVal) && mhVal > 0) minHeight = Number(mhVal.toFixed(1));
+        }
+        let levels = null;
+        if (feat.properties['building:levels'] || feat.properties.levels) {
+          const lvlVal = parseInt(feat.properties['building:levels'] || feat.properties.levels, 10);
+          if (!isNaN(lvlVal) && lvlVal > 0) levels = lvlVal;
+        }
+        // Fallback: estimate height using 3.2m per floor if levels present
+        if (height === null && levels !== null) {
+          height = Number((levels * 3.2).toFixed(1));
+        }
+        const kind = feat.properties.building || feat.properties.kind || feat.properties.class || 'building';
+        const yearBuilt = feat.properties.start_date || feat.properties.year_built || null;
+        const addrHousenumber = feat.properties['addr:housenumber'] || null;
+        const addrStreet = feat.properties['addr:street'] || null;
+
+        buildingPolygons.push({
+          ring: coords,
+          center,
+          height,
+          minHeight,
+          levels,
+          kind,
+          yearBuilt,
+          addrHousenumber,
+          addrStreet
+        });
       }
     }
   }
@@ -197,20 +232,57 @@ async function main() {
     covBuf[i] = (c1 & 0x0F) | ((c2 & 0x0F) << 4);
   }
 
+  let withHeight = 0, withLevels = 0, maxHeight = 0, sumHeight = 0;
+  for (const b of buildingPolygons) {
+    if (b.height) {
+      withHeight++;
+      sumHeight += b.height;
+      if (b.height > maxHeight) maxHeight = b.height;
+    }
+    if (b.levels) withLevels++;
+  }
+
   const buildingsJson = {
-    v: 1,
+    v: 2,
     w: Number(w.toFixed(4)),
     s: Number(s.toFixed(4)),
     cellLon: CELL_LON,
     cellLat: CELL_LAT,
     nx,
     ny,
-    cov: covBuf.toString('base64')
+    cov: covBuf.toString('base64'),
+    stats: {
+      total: buildingPolygons.length,
+      withHeight,
+      withLevels,
+      maxHeight,
+      avgHeight: withHeight > 0 ? Number((sumHeight / withHeight).toFixed(1)) : 0
+    }
   };
 
   const jsonOutPath = path.join(outDir, 'buildings.json');
   fs.writeFileSync(jsonOutPath, JSON.stringify(buildingsJson));
-  console.log(`  ✓ Wrote ${jsonOutPath} (${fs.statSync(jsonOutPath).size} bytes)`);
+  console.log(`  ✓ Wrote ${jsonOutPath} (${fs.statSync(jsonOutPath).size} bytes, ${withHeight} with height, max ${maxHeight}m)`);
+
+  // --- Optional: BUILD buildings-3d.json for WebGL extrusions ---
+  if (withHeight > 0 || withLevels > 0) {
+    const features3d = buildingPolygons.map(b => ({
+      type: 'Feature',
+      geometry: { type: 'Polygon', coordinates: [b.ring] },
+      properties: {
+        height: b.height,
+        min_height: b.minHeight,
+        levels: b.levels,
+        kind: b.kind,
+        year_built: b.yearBuilt,
+        addr_housenumber: b.addrHousenumber,
+        addr_street: b.addrStreet
+      }
+    }));
+    const bldg3dPath = path.join(outDir, 'buildings-3d.json');
+    fs.writeFileSync(bldg3dPath, JSON.stringify({ type: 'FeatureCollection', features: features3d }));
+    console.log(`  ✓ Wrote ${bldg3dPath} (${features3d.length} 3D features)`);
+  }
 
   // --- 2. BUILD buildings.bin (TKBL binary format) ---
   // Header: 32 bytes
