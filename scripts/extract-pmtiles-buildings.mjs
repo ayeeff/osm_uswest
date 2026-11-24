@@ -264,21 +264,35 @@ async function main() {
   fs.writeFileSync(jsonOutPath, JSON.stringify(buildingsJson));
   console.log(`  ✓ Wrote ${jsonOutPath} (${fs.statSync(jsonOutPath).size} bytes, ${withHeight} with height, max ${maxHeight}m)`);
 
-  // --- Optional: BUILD buildings-3d.json for WebGL extrusions ---
-  if (withHeight > 0 || withLevels > 0) {
-    const features3d = buildingPolygons.map(b => ({
-      type: 'Feature',
-      geometry: { type: 'Polygon', coordinates: [b.ring] },
-      properties: {
-        height: b.height,
-        min_height: b.minHeight,
-        levels: b.levels,
-        kind: b.kind,
-        year_built: b.yearBuilt,
-        addr_housenumber: b.addrHousenumber,
-        addr_street: b.addrStreet
+  // --- BUILD buildings-3d.json for WebGL extrusions ---
+  if (buildingPolygons.length > 0) {
+    const features3d = buildingPolygons.map((b, idx) => {
+      let finalHeight = b.height;
+      if (finalHeight === null || finalHeight <= 0) {
+        // Deterministic procedural height if untagged
+        const seed = Math.abs(Math.round(b.center[0] * 1e5 + b.center[1] * 1e5 + idx * 137));
+        const tier = seed % 16;
+        if (tier === 0) finalHeight = 160 + (seed % 65) * 1.25;
+        else if (tier <= 2) finalHeight = 105 + (seed % 40) * 1.15;
+        else if (tier <= 5) finalHeight = 65 + (seed % 30) * 1.05;
+        else if (tier <= 9) finalHeight = 38 + (seed % 20);
+        else finalHeight = 24 + (seed % 10);
+        finalHeight = Number(finalHeight.toFixed(1));
       }
-    }));
+      return {
+        type: 'Feature',
+        geometry: { type: 'Polygon', coordinates: [b.ring] },
+        properties: {
+          height: finalHeight,
+          min_height: b.minHeight || 0,
+          levels: b.levels || Math.max(1, Math.round(finalHeight / 3.2)),
+          kind: b.kind,
+          year_built: b.yearBuilt,
+          addr_housenumber: b.addrHousenumber,
+          addr_street: b.addrStreet
+        }
+      };
+    });
     const bldg3dPath = path.join(outDir, 'buildings-3d.json');
     fs.writeFileSync(bldg3dPath, JSON.stringify({ type: 'FeatureCollection', features: features3d }));
     console.log(`  ✓ Wrote ${bldg3dPath} (${features3d.length} 3D features)`);

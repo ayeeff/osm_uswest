@@ -23,9 +23,18 @@ mkdir -p "$WORKDIR"
 echo "=== Processing city: ${SLUG} ==="
 
 # 1. Download source PMTiles from R2
-echo "[1/4] Downloading s3://globe/data/${SLUG}-2d/${SLUG}.pmtiles..."
-if ! aws s3 cp "s3://globe/data/${SLUG}-2d/${SLUG}.pmtiles" "${WORKDIR}/input.pmtiles" --endpoint-url "$ENDPOINT"; then
-  echo "  [SKIP] s3://globe/data/${SLUG}-2d/${SLUG}.pmtiles not found in R2."
+echo "[1/4] Downloading source PMTiles..."
+FOUND=0
+if aws s3 cp "s3://globe/data/${SLUG}-2d/${SLUG}.pmtiles" "${WORKDIR}/input.pmtiles" --endpoint-url "$ENDPOINT"; then
+  FOUND=1
+elif aws s3 cp "s3://globe/basemaps/${SLUG}.pmtiles" "${WORKDIR}/input.pmtiles" --endpoint-url "$ENDPOINT"; then
+  FOUND=1
+elif aws s3 cp "s3://globe/basemaps/${SLUG}-buildings.pmtiles" "${WORKDIR}/input.pmtiles" --endpoint-url "$ENDPOINT"; then
+  FOUND=1
+fi
+
+if [ "$FOUND" -eq 0 ]; then
+  echo "  [SKIP] No PMTiles found for ${SLUG} in R2."
   rm -rf "$WORKDIR"
   exit 0
 fi
@@ -48,18 +57,18 @@ node scripts/extract-pmtiles-buildings.mjs \
   --city "${SLUG}" || true
 
 # 4. Upload updated artifacts to R2 globe bucket
-echo "[4/4] Uploading updated artifacts to R2 (s3://globe/data/${SLUG}-2d/)..."
+echo "[4/4] Uploading updated artifacts to R2 (s3://globe/data/${SLUG}-2d/ and data/guide/${SLUG}/)..."
 
 if [ -f "${WORKDIR}/out/buildings.json" ] && [ -f "${WORKDIR}/out/buildings.bin" ]; then
   aws s3 cp "${WORKDIR}/out/buildings.json" "s3://globe/data/${SLUG}-2d/buildings.json" --endpoint-url "$ENDPOINT"
   aws s3 cp "${WORKDIR}/out/buildings.bin" "s3://globe/data/${SLUG}-2d/buildings.bin" --endpoint-url "$ENDPOINT"
   echo "  ✓ Uploaded buildings.json and buildings.bin"
-  if [ -f "${WORKDIR}/out/buildings-3d.json" ]; then
-    aws s3 cp "${WORKDIR}/out/buildings-3d.json" "s3://globe/data/${SLUG}-2d/buildings-3d.json" --endpoint-url "$ENDPOINT"
-    echo "  ✓ Uploaded buildings-3d.json"
-  fi
-else
-  echo "  - No buildings extracted for ${SLUG}."
+fi
+
+if [ -f "${WORKDIR}/out/buildings-3d.json" ]; then
+  aws s3 cp "${WORKDIR}/out/buildings-3d.json" "s3://globe/data/guide/${SLUG}/buildings-3d.json" --endpoint-url "$ENDPOINT"
+  aws s3 cp "${WORKDIR}/out/buildings-3d.json" "s3://globe/data/${SLUG}-2d/buildings-3d.json" --endpoint-url "$ENDPOINT"
+  echo "  ✓ Uploaded buildings-3d.json to data/guide/${SLUG}/ and data/${SLUG}-2d/"
 fi
 
 if [ -f "${WORKDIR}/${SLUG}-nobuildings.pmtiles" ]; then
