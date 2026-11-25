@@ -1,4 +1,4 @@
-name: Extract 3D Buildings GeoJSON
+name: Extract 3D Buildings PMTiles
 
 on:
   workflow_dispatch:
@@ -121,12 +121,16 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install osmium + pyosmium
+      - name: Install osmium + pyosmium + tippecanoe
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y osmium-tool
+          sudo apt-get install -y osmium-tool build-essential libsqlite3-dev zlib1g-dev pkg-config
           pip3 install --break-system-packages --quiet osmium
+          git clone --depth 1 https://github.com/felt/tippecanoe.git
+          cd tippecanoe && make -j$(nproc) && sudo make install && cd ..
+          rm -rf tippecanoe
+          tippecanoe --version
 
       - name: Configure R2
         run: |
@@ -151,7 +155,7 @@ jobs:
           aws s3 cp "s3://$R2_BUCKET/$SOURCE_KEY" "work/src.osm.pbf" --no-progress --only-show-errors
           echo "ok=true" >> "$GITHUB_OUTPUT"
 
-      - name: Extract and upload buildings-3d.json
+      - name: Extract and upload buildings PMTiles
         if: steps.fetch.outputs.ok == 'true'
         run: |
           set -euo pipefail
@@ -186,6 +190,7 @@ jobs:
             CITY_PBF="work/${SLUG}.osm.pbf"
             BLDG_PBF="work/${SLUG}-bldg.osm.pbf"
             OUT_JSON="work/${SLUG}-buildings-3d.json"
+            OUT_PMT="work/${SLUG}-buildings.pmtiles"
 
             if ! osmium extract -b "$BBOX" -s complete_ways -F pbf -o "$CITY_PBF" "$COARSE" >/dev/null 2>&1; then
               echo "  [WARN] osmium extract failed for $SLUG"
@@ -203,10 +208,37 @@ jobs:
             python3 scripts/extract_buildings_3d.py --pbf "$BLDG_PBF" --out "$OUT_JSON" --city "$SLUG"
             rm -f "$BLDG_PBF"
 
-            if [ -s "$OUT_JSON" ]; then
-              aws s3 cp "$OUT_JSON" "s3://globe/data/guide/${SLUG}/buildings-3d.json" --content-type "application/json" --no-progress --only-show-errors
-              aws s3 cp "$OUT_JSON" "s3://globe/data/${SLUG}-2d/buildings-3d.json" --content-type "application/json" --no-progress --only-show-errors
-              echo "  ✓ Uploaded buildings-3d.json for $SLUG"
+            if [ ! -s "$OUT_JSON" ]; then
+              echo "  [WARN] No buildings extracted for $SLUG"
+              continue
             fi
+
+            # Convert GeoJSON → compact PMTiles via tippecanoe
+            # z12=city overview, z16=detailed footprints; drop points/lines (buildings are polygons only)
+            # --no-simplification-of-shared-nodes: preserve exact footprints for 3D extrusion
+            tippecanoe \
+              --output "$OUT_PMT" \
+              --minimum-zoom=12 \
+              --maximum-zoom=16 \
+              --layer=building \
+              --attribute-type=height:float \
+              --attribute-type=min_height:float \
+              --attribute-type=levels:int \
+              --no-tile-compression \
+              --no-simplification-of-shared-nodes \
+              --drop-fraction-as-needed \
+              --force \
+              "$OUT_JSON" \
+              2>&1 | tail -5
             rm -f "$OUT_JSON"
+
+            if [ -s "$OUT_PMT" ]; then
+              PMT_MB=$(du -m "$OUT_PMT" | cut -f1)
+              aws s3 cp "$OUT_PMT" "s3://globe/data/guide/${SLUG}/buildings.pmtiles" \
+                --content-type "application/octet-stream" --no-progress --only-show-errors
+              echo "  ✓ Uploaded buildings.pmtiles for $SLUG (${PMT_MB}MB)"
+            else
+              echo "  [WARN] tippecanoe produced empty PMTiles for $SLUG"
+            fi
+            rm -f "$OUT_PMT"
           done
