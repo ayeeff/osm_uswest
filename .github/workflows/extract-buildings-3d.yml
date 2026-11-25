@@ -46,7 +46,11 @@ jobs:
               if slug and ext and bbox and len(bbox) == 4:
                   by_slug[slug] = {'slug': slug, 'extract': ext, 'bbox': bbox, 'alias': None}
 
-          # Known aliases / missing big-city overrides
+          # Known aliases / missing big-city overrides / US-South region fixes
+          US_SOUTH = {'fortlauderdale', 'miami', 'atlanta', 'dallas', 'houston', 'austin'}
+          for s in US_SOUTH:
+              if s in by_slug:
+                  by_slug[s]['extract'] = 'us-south'
           if 'hochiminhcity' in by_slug and 'hochiminh' not in by_slug:
               e = dict(by_slug['hochiminhcity'])
               e['slug'] = 'hochiminh'
@@ -124,8 +128,11 @@ jobs:
       - name: Install osmium + pyosmium + tippecanoe
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y osmium-tool build-essential libsqlite3-dev zlib1g-dev pkg-config
+          for attempt in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y osmium-tool build-essential libsqlite3-dev zlib1g-dev pkg-config && break
+            echo "apt-get retry $attempt..."
+            sleep 5
+          done
           pip3 install --break-system-packages --quiet osmium
           git clone --depth 1 https://github.com/felt/tippecanoe.git
           cd tippecanoe && make -j$(nproc) && sudo make install && cd ..
@@ -214,9 +221,7 @@ jobs:
             fi
 
             # Convert GeoJSON → compact PMTiles via tippecanoe
-            # z12=city overview, z16=detailed footprints; drop points/lines (buildings are polygons only)
-            # --no-simplification-of-shared-nodes: preserve exact footprints for 3D extrusion
-            tippecanoe \
+            if ! tippecanoe \
               --output "$OUT_PMT" \
               --minimum-zoom=12 \
               --maximum-zoom=16 \
@@ -229,12 +234,18 @@ jobs:
               --drop-fraction-as-needed \
               --force \
               "$OUT_JSON" \
-              2>&1 | tail -5
+              2>&1 | tail -5; then
+              echo "  [WARN] tippecanoe failed for $SLUG (likely 0 buildings)"
+              rm -f "$OUT_JSON" "$OUT_PMT"
+              continue
+            fi
             rm -f "$OUT_JSON"
 
             if [ -s "$OUT_PMT" ]; then
               PMT_MB=$(du -m "$OUT_PMT" | cut -f1)
               aws s3 cp "$OUT_PMT" "s3://globe/data/guide/${SLUG}/buildings.pmtiles" \
+                --content-type "application/octet-stream" --no-progress --only-show-errors
+              aws s3 cp "$OUT_PMT" "s3://globe/data/${SLUG}-2d/buildings.pmtiles" \
                 --content-type "application/octet-stream" --no-progress --only-show-errors
               echo "  ✓ Uploaded buildings.pmtiles for $SLUG (${PMT_MB}MB)"
             else
