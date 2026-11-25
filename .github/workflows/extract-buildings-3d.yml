@@ -1,0 +1,212 @@
+name: Extract 3D Buildings GeoJSON
+
+on:
+  workflow_dispatch:
+    inputs:
+      cities:
+        description: "Comma-separated city slugs (empty = all cities in cities-neighborhoods.json)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: extract-buildings-3d-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      groups: ${{ steps.plan.outputs.groups }}
+      has_groups: ${{ steps.plan.outputs.has_groups }}
+    env:
+      REQUESTED_CITIES: ${{ inputs.cities }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build extract groups
+        id: plan
+        run: |
+          python3 - <<'PY'
+          import json, os
+
+          req_raw = os.environ.get('REQUESTED_CITIES', '').strip()
+          req = [s.strip() for s in req_raw.split(',') if s.strip()] if req_raw else []
+
+          with open('cities-neighborhoods.json', 'r', encoding='utf-8') as f:
+              data = json.load(f)
+
+          by_slug = {}
+          for c in data.get('cities', []):
+              slug = c.get('slug')
+              ext = c.get('extract') or c.get('geofabrik')
+              bbox = c.get('bbox')
+              if slug and ext and bbox and len(bbox) == 4:
+                  by_slug[slug] = {'slug': slug, 'extract': ext, 'bbox': bbox, 'alias': None}
+
+          # Known aliases / missing big-city overrides
+          if 'hochiminhcity' in by_slug and 'hochiminh' not in by_slug:
+              e = dict(by_slug['hochiminhcity'])
+              e['slug'] = 'hochiminh'
+              e['alias'] = 'hochiminhcity'
+              by_slug['hochiminh'] = e
+          if 'mexicocity' not in by_slug and any(v['extract'] == 'mexico' for v in by_slug.values()):
+              by_slug['mexicocity'] = {
+                  'slug': 'mexicocity', 'extract': 'mexico',
+                  'bbox': [-99.36, 19.05, -98.94, 19.59], 'alias': None
+              }
+
+          selected = []
+          if req:
+              for s in req:
+                  if s in by_slug:
+                      selected.append(by_slug[s])
+                  else:
+                      print(f"Skipping {s}: not in this repo's cities-neighborhoods.json")
+          else:
+              selected = list(by_slug.values())
+
+          by_ext = {}
+          for item in selected:
+              by_ext.setdefault(item['extract'], []).append(item)
+
+          groups = []
+          CHUNK = 15
+          for ext, items in sorted(by_ext.items()):
+              for i in range(0, len(items), CHUNK):
+                  chunk = items[i:i+CHUNK]
+                  cities_str = ' '.join(
+                      f"{x['slug']}:{x['bbox'][0]},{x['bbox'][1]},{x['bbox'][2]},{x['bbox'][3]}"
+                      for x in chunk
+                  )
+                  groups.append({
+                      'extract': ext,
+                      'safe_extract': ext.replace('/', '-'),
+                      'cities': cities_str,
+                      'count': len(chunk),
+                  })
+
+          out_json = json.dumps(groups)
+          print(f"Planned {len(groups)} jobs for {len(selected)} cities")
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as out:
+              out.write(f"groups={out_json}\n")
+              out.write(f"has_groups={'true' if len(groups) > 0 else 'false'}\n")
+          PY
+
+  extract:
+    needs: plan
+    if: needs.plan.outputs.has_groups == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        group: ${{ fromJson(needs.plan.outputs.groups) }}
+    env:
+      EXTRACT: ${{ matrix.group.extract }}
+      CITIES: ${{ matrix.group.cities }}
+      R2_BUCKET: geo-datalake
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_ENDPOINT_URL: https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install osmium + pyosmium
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y osmium-tool
+          pip3 install --break-system-packages --quiet osmium
+
+      - name: Configure R2
+        run: |
+          set -euo pipefail
+          aws configure set aws_access_key_id "$R2_ACCESS_KEY_ID"
+          aws configure set aws_secret_access_key "$R2_SECRET_ACCESS_KEY"
+
+      - name: Download country extract
+        id: fetch
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          SOURCE_KEY="sources/osm/${EXTRACT}-latest.osm.pbf"
+          SIZE=$(aws s3api head-object --bucket "$R2_BUCKET" --key "$SOURCE_KEY" \
+            --query 'ContentLength' --output text 2>/dev/null) || SIZE=""
+          if [ -z "$SIZE" ] || [ "$SIZE" = "None" ]; then
+            echo "::warning::s3://$R2_BUCKET/$SOURCE_KEY not found, skipping group."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Downloading s3://$R2_BUCKET/$SOURCE_KEY ($SIZE bytes)..."
+          aws s3 cp "s3://$R2_BUCKET/$SOURCE_KEY" "work/src.osm.pbf" --no-progress --only-show-errors
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Extract and upload buildings-3d.json
+        if: steps.fetch.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          union_bbox() {
+            local e rest
+            local -a lons=() lats=()
+            for e in $CITIES; do
+              rest="${e#*:}"
+              IFS=',' read -r -a p <<< "$rest"
+              lons+=("${p[0]}" "${p[2]}")
+              lats+=("${p[1]}" "${p[3]}")
+            done
+            printf '%s,%s,%s,%s' \
+              "$(printf '%s\n' "${lons[@]}" | sort -g | head -1)" \
+              "$(printf '%s\n' "${lats[@]}" | sort -g | head -1)" \
+              "$(printf '%s\n' "${lons[@]}" | sort -g | tail -1)" \
+              "$(printf '%s\n' "${lats[@]}" | sort -g | tail -1)"
+          }
+
+          UNION=$(union_bbox)
+          echo "Coarse cut for union bbox: $UNION"
+          COARSE="work/coarse.osm.pbf"
+          if ! osmium extract -b "$UNION" -s complete_ways -F pbf -o "$COARSE" work/src.osm.pbf >/dev/null 2>&1; then
+            COARSE="work/src.osm.pbf"
+          fi
+          rm -f work/src.osm.pbf || true
+
+          for ENTRY in $CITIES; do
+            SLUG="${ENTRY%%:*}"
+            BBOX="${ENTRY#*:}"
+            echo "=== Processing $SLUG ($BBOX) ==="
+            CITY_PBF="work/${SLUG}.osm.pbf"
+            BLDG_PBF="work/${SLUG}-bldg.osm.pbf"
+            OUT_JSON="work/${SLUG}-buildings-3d.json"
+
+            if ! osmium extract -b "$BBOX" -s complete_ways -F pbf -o "$CITY_PBF" "$COARSE" >/dev/null 2>&1; then
+              echo "  [WARN] osmium extract failed for $SLUG"
+              rm -f "$CITY_PBF"
+              continue
+            fi
+
+            if ! osmium tags-filter "$CITY_PBF" w/building r/building -F pbf -o "$BLDG_PBF" >/dev/null 2>&1; then
+              echo "  [WARN] osmium tags-filter failed for $SLUG"
+              rm -f "$CITY_PBF" "$BLDG_PBF"
+              continue
+            fi
+            rm -f "$CITY_PBF"
+
+            python3 scripts/extract_buildings_3d.py --pbf "$BLDG_PBF" --out "$OUT_JSON" --city "$SLUG"
+            rm -f "$BLDG_PBF"
+
+            if [ -s "$OUT_JSON" ]; then
+              aws s3 cp "$OUT_JSON" "s3://globe/data/guide/${SLUG}/buildings-3d.json" --content-type "application/json" --no-progress --only-show-errors
+              aws s3 cp "$OUT_JSON" "s3://globe/data/${SLUG}-2d/buildings-3d.json" --content-type "application/json" --no-progress --only-show-errors
+              echo "  ✓ Uploaded buildings-3d.json for $SLUG"
+            fi
+            rm -f "$OUT_JSON"
+          done
